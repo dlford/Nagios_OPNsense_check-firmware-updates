@@ -1,0 +1,79 @@
+#!/bin/bash
+
+# check_firmware_updates Nagios plugin by DL Ford
+# Dependencies: jq
+
+while getopts h:k:s: flag
+do
+  case "${flag}" in
+    h) host=${OPTARG};;
+    k) key=${OPTARG};;
+    s) secret=${OPTARG};;
+  esac
+done
+
+if [ -z "$host" ] || [ -z "$key" ] || [ -z "$secret" ]; then
+  echo "Usage: check_firmware_updates -h HOSTNAME -k API_KEY -s API_SECRET"
+  exit 3
+fi
+
+getStatus() {
+	response=$(curl -s -k -m 30 -u "$key":"$secret" https://"$host"/api/core/firmware/status)
+}
+
+curl -s -k -m 30 \
+	-H "Content-Type: application/json" \
+	-d "{}" --user "$key:$secret" -X POST \
+	https://"$host"/api/core/firmware/check \
+	> /dev/null 2>&1
+
+getStatus
+
+tries=0
+while [[ true ]]; do
+	if /usr/bin/jq -e . >/dev/null 2>&1 <<<"$response"; then
+		status=$(/usr/bin/jq -r '.status' <<<"$response")
+		if [[ $status != "error" ]]; then
+			break
+		fi
+	fi
+	if [[ tries -ge 15 ]]; then
+		if /usr/bin/jq -e . >/dev/null 2>&1 <<<"$response"; then
+			echo "Firmware Updates UNKNOWN: Update check timed out after 30 seconds"
+		else
+			echo "Firmware Updates UNKNOWN: Failed to parse JSON response, or got false/null"
+		fi
+		exit 3
+	fi
+	getStatus
+	((tries++))
+	sleep 2
+done
+
+status=$(/usr/bin/jq -r '.status' <<<"$response")
+download_size=$(/usr/bin/jq -r '.download_size' <<<"$response")
+message=$(/usr/bin/jq -r '.status_msg' <<<"$response")
+
+if [[ $status == "none" ]]; then
+	last_check=$(/usr/bin/jq -r '.last_check' <<<"$response")
+	echo "Firmware Updates OK: Up to date as of $last_check | $message"
+	exit 0
+fi
+
+if [[ $status == "ok" ]] || [[ $status == "upgrade" ]] || [[ $download_size != "" ]]; then
+  upgrade_needs_reboot=$(/usr/bin/jq -r '.upgrade_needs_reboot' <<<"$response")
+  if [[ $upgrade_needs_reboot == "0" ]]; then
+    reboot="No"
+  else
+    reboot="Yes"
+  fi
+  if [[ $upgrade_needs_reboot == "1" ]]; then
+    echo "Firmware Updates CRITICAL: $message | Reboot required: $reboot"
+    exit 2
+  fi
+	echo "Firmware Updates WARNING: $message | Reboot required: $reboot"
+	exit 1
+fi
+
+echo "Firmware Updates UNKNOWN: Script error | Please update check_firmware_updates script"
+exit 3
